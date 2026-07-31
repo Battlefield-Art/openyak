@@ -430,7 +430,10 @@ jobs:
             exit 1
           fi
 
-          DOWNLOAD_BASE="https://open-yak.com/downloads"
+          # Release assets are immutable and GitHub serves them globally. Keep
+          # the manifest and the signed artifacts on the same release so the
+          # desktop updater has no dependency on the marketing website.
+          DOWNLOAD_BASE="https://github.com/openyak/openyak/releases/download/${TAG}"
 
           cat > latest.json <<EOF
           {
