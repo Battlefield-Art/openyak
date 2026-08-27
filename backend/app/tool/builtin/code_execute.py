@@ -15,7 +15,7 @@ import os
 import traceback
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from app.tool.base import ToolDefinition, ToolResult
 from app.tool.context import ToolContext
@@ -55,6 +55,11 @@ class CodeExecuteTool(ToolDefinition):
     @property
     def id(self) -> str:
         return "code_execute"
+
+    @property
+    def truncation_direction(self) -> Literal["head", "tail"]:
+        """Keep the end: a failed run reports why on its last lines."""
+        return "tail"
 
     @property
     def description(self) -> str:
@@ -190,6 +195,10 @@ def _run_code(
 
     output = "\n".join(parts) if parts else "(no output)"
     if exit_code != 0:
-        output = f"Exit code: {exit_code}\n{output}"
+        # Trailing, not leading: this tool truncates from the head (see
+        # truncation_direction), so a header on a long failing run is the first
+        # thing dropped — and it is the only signal the model gets that the
+        # command failed at all.
+        output = f"{output}\n\nExit code: {exit_code}"
 
     return output, exit_code

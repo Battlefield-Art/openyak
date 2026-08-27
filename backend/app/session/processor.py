@@ -29,15 +29,18 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.agent.agent import AgentRegistry
 from app.agent.permission import (
     RejectedError,
+    agent_verdict,
     evaluate,
     pattern_matches,
 )
+from app.provider.base import ProviderStreamError
 from app.provider.registry import ProviderRegistry
 from app.schemas.agent import PermissionRule
 from app.schemas.chat import PromptRequest
 from app.schemas.message import StepFinishReason
 from app.session.llm import stream_llm
 from app.session.loop_detection import LoopCheckResult, loop_detector
+from app.session.middleware import ToolAction
 from app.session.manager import (
     create_part,
     get_messages,
@@ -560,8 +563,12 @@ class SessionProcessor:
     async def _stream_llm_with_retry(self) -> Literal["stop"] | None:
         """Stream from the LLM with retry. Mutates self._accumulated_*, self._stream_error.
 
-        Returns "stop" early only for fatal in-stream conditions (non-vision model
-        received images, or the stream chunk reported an explicit error).
+        Every stream failure arrives as a raised exception — providers never
+        signal one with a chunk — so all of them reach the classifier below and
+        share one backoff, retry budget, and context-overflow recovery path.
+
+        Returns "stop" early only for a non-vision model that was sent images;
+        stream failures leave ``self._stream_error`` set for the caller.
         """
         sp = self._sp
         job = sp.job
@@ -656,7 +663,14 @@ class SessionProcessor:
                             )
 
                         case "error":
-                            return await self._handle_stream_error_chunk(chunk)
+                            # Defensive net for a provider that still yields an
+                            # error chunk instead of raising (custom or
+                            # third-party). Raising routes it through the same
+                            # classifier as every other stream failure.
+                            raise ProviderStreamError(
+                                str(chunk.data.get("message", "LLM error")),
+                                code=chunk.data.get("code"),
+                            )
 
                 self._stream_error = None
                 logger.info(
@@ -690,6 +704,22 @@ class SessionProcessor:
                 self._stream_error = e
                 retry_reason = is_retryable(e)
                 effective_max = max_retries_for_error(e)
+
+                if retry_reason and self._streaming_executor.has_submissions:
+                    # Tool calls from this attempt are already dispatched, and
+                    # some have side effects that cannot be taken back — a sent
+                    # email, a written file. Replaying the stream would submit
+                    # them a second time, because the executor and
+                    # ``_exec_metadata`` outlive ``_reset_stream_accumulators``.
+                    # Stop instead and let the outer loop surface the failure
+                    # with whatever the tools produced.
+                    logger.warning(
+                        "Stream failed after %d tool call(s) were dispatched; not "
+                        "retrying to avoid re-running them: %s",
+                        len(self._tool_calls_in_step),
+                        e,
+                    )
+                    retry_reason = None
 
                 if retry_reason and attempt < effective_max:
                     delay = retry_delay(attempt, e)
@@ -842,18 +872,27 @@ class SessionProcessor:
             and isinstance(raw_tool_args, dict)
         )
 
-        # Loop detection
-        lr: LoopCheckResult = loop_detector.check(job.session_id, tn, ta)
-        if lr.action == "block":
+        # Pre-execution policy. Loop detection lives in the middleware chain
+        # rather than inline here, so its warn stage (which stashes a message
+        # for after_tool_exec to append) actually runs, and so any other policy
+        # middleware gets the same hook instead of a seam nothing calls.
+        if self._mw_ctx is not None:
+            policy = await sp.middleware_chain.run_before_tool_exec(tn, ta, self._mw_ctx)
+        else:
+            # No chain (direct construction in tests) — run the detector itself
+            # so loop protection is never silently absent.
+            lr: LoopCheckResult = loop_detector.check(job.session_id, tn, ta)
+            policy = ToolAction(action=lr.action, message=lr.message)
+        if policy.action == "block":
             job.publish(SSEEvent(AGENT_ERROR, {
                 "error_type": "loop_detected",
-                "error_message": lr.message,
+                "error_message": policy.message,
                 "tool": tn,
             }))
             await _persist_tool_error(
                 session_factory, self._assistant_msg_id,
                 job.session_id, tn, ci, ta,
-                lr.message or "Loop detected — hard stop",
+                policy.message or "Loop detected — hard stop",
             )
             self._exec_blocked = True
             return
@@ -946,7 +985,7 @@ class SessionProcessor:
                 if parsed.scheme in {"http", "https"} and parsed.hostname:
                     port = f":{parsed.port}" if parsed.port else ""
                     rp = f"{parsed.scheme.lower()}://{parsed.hostname.lower()}{port}"
-        if evaluate(tool.id, rp, sp.agent.permissions) == "deny":
+        if agent_verdict(tool.id, rp, sp.agent.permissions) == "deny":
             message = f"Agent policy denied tool: {tool.id}"
             job.publish(SSEEvent(TOOL_ERROR, {
                 "call_id": ci,
@@ -1036,10 +1075,7 @@ class SessionProcessor:
             "tool_registry": sp.tool_registry,
             "stream_manager": get_stream_manager(),
         }
-        effective_permission_rules = tuple(
-            rule.model_dump()
-            for rule in sp.merged_permissions.rules
-        )
+        effective_permission_rules = self._inheritable_permission_rules()
         ctx = ToolContext(
             session_id=job.session_id,
             message_id=self._assistant_msg_id,
@@ -1086,7 +1122,7 @@ class SessionProcessor:
         ))
         self._exec_metadata[self._exec_index] = {
             "tool_part_id": tool_part_id,
-            "loop_result": lr,
+            "policy_decision": policy,
             "tool": tool,
             "tool_args": ta,
             "call_id": ci,
@@ -1205,27 +1241,6 @@ class SessionProcessor:
             },
         ))
 
-    async def _handle_stream_error_chunk(self, chunk: Any) -> Literal["stop"]:
-        """Mid-stream 'error' chunk: persist any accumulated text + publish error + clean up."""
-        sp = self._sp
-        job = sp.job
-
-        if self._accumulated_text:
-            async with sp.session_factory() as db:
-                async with db.begin():
-                    await create_part(
-                        db,
-                        message_id=self._assistant_msg_id,
-                        session_id=job.session_id,
-                        data={"type": "text", "text": self._accumulated_text},
-                    )
-        job.publish(SSEEvent(
-            AGENT_ERROR,
-            {"error_message": chunk.data.get("message", "LLM error")},
-        ))
-        await _delete_empty_assistant_messages(sp.session_factory, job.session_id)
-        return "stop"
-
     # ------------------------------------------------------------------
     # process() phases — post-stream
     # ------------------------------------------------------------------
@@ -1234,6 +1249,27 @@ class SessionProcessor:
         """Handle a retries-exhausted or non-retryable stream exception."""
         sp = self._sp
         job = sp.job
+
+        # The stream can fail after tool calls were dispatched. Nothing else
+        # will collect them from here, so record what actually happened and
+        # terminate the rest, rather than leaving rows that never resolve.
+        if self._streaming_executor.has_submissions:
+            # Tools that finished during streaming really did run. Persist their
+            # real outcome first — sweeping them into the cancellation cleanup
+            # would tell the user an email was not sent when it was.
+            for exec_result in self._streaming_executor.harvest_finished():
+                meta = self._exec_metadata.get(exec_result.index)
+                if meta is None:
+                    continue
+                try:
+                    await self._finalize_exec_result(exec_result.index, meta, exec_result)
+                except Exception:
+                    logger.warning(
+                        "Could not persist a tool result after the stream failed; "
+                        "cancellation cleanup will terminate its part",
+                        exc_info=True,
+                    )
+            await self._cancel_running_tools()
 
         # --- Reactive compact: recover from context overflow via compaction ---
         # Inspired by Claude Code's reactive compact pattern.
@@ -1245,7 +1281,14 @@ class SessionProcessor:
             await _delete_empty_assistant_messages(sp.session_factory, job.session_id)
             return "compact"
 
-        logger.exception("LLM stream error (not retryable or retries exhausted)")
+        # Not inside an `except` block — `logger.exception` here would append a
+        # bare "NoneType: None". Carry the exception explicitly; this line is
+        # the primary diagnostic for every provider stream failure.
+        logger.error(
+            "LLM stream error (not retryable or retries exhausted): %s",
+            self._stream_error,
+            exc_info=self._stream_error,
+        )
         self.has_text = bool(self._accumulated_text.strip())
         self.finish_reason = "error"
         if self._accumulated_text or self._accumulated_reasoning:
@@ -1426,6 +1469,19 @@ class SessionProcessor:
 
         return None
 
+    def _inheritable_permission_rules(self) -> tuple[dict[str, Any], ...]:
+        """The rules a subagent spawned from this turn will be given.
+
+        ``task`` and ``swarm`` pass ``ToolContext.permission_rules`` straight to
+        the child, where it lands in the request layer — *after* the child's own
+        agent rules under last-match-wins. So it must carry this session's
+        restrictions and nothing permissive: handing down the fully merged set
+        would put the global ``allow *`` above the child's own ``deny *``.
+        """
+        return tuple(
+            rule.model_dump() for rule in self._sp.inheritable_permissions.rules
+        )
+
     async def _cancel_running_tools(self) -> None:
         """Cancel executor work and durably terminate every running ToolPart."""
         self._streaming_executor.cancel_all()
@@ -1524,7 +1580,7 @@ class SessionProcessor:
         session_factory = sp.session_factory
 
         tool_part_id = meta["tool_part_id"]
-        loop_result = meta["loop_result"]
+        policy_decision = meta["policy_decision"]
         tool = meta["tool"]
         tool_args = meta["tool_args"]
         call_id = meta["call_id"]
@@ -1606,7 +1662,7 @@ class SessionProcessor:
 
         await self._apply_tool_side_effects(tool, result)
         persist_output = await self._build_tool_persist_output(
-            tool, tool_args, result, loop_result,
+            tool, tool_args, result, policy_decision,
         )
 
         # Persist file attachments returned by the tool as FileParts
@@ -1724,7 +1780,7 @@ class SessionProcessor:
         tool: Any,
         tool_args: dict[str, Any],
         result: Any,
-        loop_result: Any,
+        policy_decision: ToolAction,
     ) -> str:
         """Assemble the output text persisted to the tool part (+ reminders, middleware)."""
         sp = self._sp
@@ -1733,9 +1789,16 @@ class SessionProcessor:
         if result.success:
             persist_output += _presentation_reminder(tool.id, result.metadata)
 
-        # Inject loop warning into output so LLM sees it
-        if loop_result.action == "warn" and loop_result.message:
-            persist_output += f"\n\n{loop_result.message}"
+        # A "warn" verdict is appended by LoopDetectionMiddleware.after_tool_exec
+        # (via the message it stashed in before_tool_exec), so only the
+        # chain-less path has to do it here — mirroring the run_after_tool_exec
+        # call at the end of this method.
+        if (
+            self._mw_ctx is None
+            and policy_decision.action == "warn"
+            and policy_decision.message
+        ):
+            persist_output += f"\n\n{policy_decision.message}"
 
         if (
             tool.id in _MODIFYING_TOOLS
@@ -1991,6 +2054,9 @@ async def _remember_permission_rule(
     ]
     sp.session_permissions.rules.append(rule)
     sp.merged_permissions.rules.append(rule)
+    # `inheritable_permissions` picks this up on its own: it is derived from
+    # `session_permissions` above, so a remembered denial reaches subagents
+    # while still sitting *below* the agent-denial ceiling.
 
 
 def _permission_arguments_for_event(

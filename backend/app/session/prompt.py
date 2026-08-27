@@ -23,13 +23,14 @@ from app.agent.agent import AgentRegistry
 from app.agent.agent import ULTRA_PROMPT
 from app.agent.permission import (
     GLOBAL_DEFAULTS,
+    agent_verdict,
     merge_rulesets,
     parse_session_permissions,
     presets_to_ruleset,
 )
 from app.models.message import Message, Part
 from app.provider.registry import ProviderRegistry
-from app.schemas.agent import Ruleset
+from app.schemas.agent import PermissionRule, Ruleset
 from app.schemas.chat import PromptRequest
 from app.session.manager import (
     create_message,
@@ -161,6 +162,17 @@ class SessionPrompt:
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
+
+    @property
+    def inheritable_permissions(self) -> Ruleset:
+        """Recomputed on every read, never snapshotted.
+
+        A stored copy invites callers to append to it — and ``_remember_permission_rule``
+        did, landing a remembered ``allow`` *after* the agent denials that are
+        placed last precisely so nothing permissive can outrank them. Deriving
+        it keeps the layer order authoritative in one place.
+        """
+        return self._merge_inheritable_permissions()
 
     @property
     def system_prompt(self) -> str | list[dict[str, Any]]:
@@ -577,6 +589,25 @@ class SessionPrompt:
                 "total": processor.usage_data.get("total", 0),
             }
 
+    def _record_compaction_failure(self) -> bool:
+        """Count one unproductive compaction. Returns True when the loop must stop."""
+        self._consecutive_compact_failures += 1
+        logger.warning(
+            "Compaction freed nothing (%d/%d) for session %s",
+            self._consecutive_compact_failures,
+            self._MAX_CONSECUTIVE_COMPACT_FAILURES,
+            self.job.session_id,
+        )
+        if self._consecutive_compact_failures >= self._MAX_CONSECUTIVE_COMPACT_FAILURES:
+            self.job.publish(SSEEvent(AGENT_ERROR, {
+                "error_message": (
+                    "Context compression failed repeatedly. "
+                    "Please start a new conversation."
+                ),
+            }))
+            return True
+        return False
+
     async def _handle_compact_result(self) -> bool:
         """Handle ``result == 'compact'``.
 
@@ -646,7 +677,7 @@ class SessionPrompt:
                     )
 
             try:
-                await run_compaction(
+                compaction = await run_compaction(
                     self.job.session_id,
                     job=self.job,
                     session_factory=self.session_factory,
@@ -654,23 +685,21 @@ class SessionPrompt:
                     agent_registry=self.agent_registry,
                     model_id=self.model_id,
                 )
-                self._consecutive_compact_failures = 0
             except Exception:
-                self._consecutive_compact_failures += 1
                 logger.warning(
-                    "Compaction failed (%d/%d) for session %s",
-                    self._consecutive_compact_failures,
-                    self._MAX_CONSECUTIVE_COMPACT_FAILURES,
-                    self.job.session_id,
-                    exc_info=True,
+                    "Compaction raised for session %s", self.job.session_id, exc_info=True
                 )
-                if self._consecutive_compact_failures >= self._MAX_CONSECUTIVE_COMPACT_FAILURES:
-                    self.job.publish(SSEEvent(AGENT_ERROR, {
-                        "error_message": (
-                            "Context compression failed repeatedly. "
-                            "Please start a new conversation."
-                        ),
-                    }))
+                if self._record_compaction_failure():
+                    return True
+            else:
+                # run_compaction swallows provider failures and returns a result
+                # that freed nothing. Counting that as success would let a
+                # compaction loop that never reclaims anything reset its own
+                # circuit breaker on every pass, leaving only the step cap to
+                # stop it.
+                if compaction.tokens_freed > 0:
+                    self._consecutive_compact_failures = 0
+                elif self._record_compaction_failure():
                     return True
 
         # Todo context recovery: after compaction the LLM may have lost
@@ -931,6 +960,53 @@ class SessionPrompt:
             self.session_permissions,
         )
 
+    def _merge_inheritable_permissions(self) -> Ruleset:
+        """The rules a subagent inherits — restrictions only, never defaults.
+
+        A child slots inherited rules in *after* its own agent layer, and
+        last-match-wins means anything permissive here outranks the child's own
+        ``deny``. So two things stay out:
+
+        - ``GLOBAL_DEFAULTS``, which the child re-applies as its own first
+          layer. Passing this session's copy down would put a second
+          ``allow *`` above the child's restrictions.
+        - This agent's *permissive* rules. A persona's ``allow``/``ask``
+          defaults describe this agent, not the one being spawned; the child
+          has its own. Only the parent's denials are a ceiling, so a read-only
+          Plan session cannot delegate its way around itself.
+
+        The user's own choices — presets, request rules, session rules, and
+        remembered approvals — pass through whole and keep narrowing the child.
+        """
+        return merge_rulesets(
+            self.preset_permissions,
+            self.request_permissions,
+            self.session_permissions,
+            # Last, so last-match-wins makes these a ceiling rather than a
+            # default. Placing them first would let an Auto preset's
+            # `allow file_changes` re-open exactly what a Plan session forbids,
+            # inside the very ruleset meant to constrain the child.
+            self._agent_denial_ceiling(),
+        )
+
+    def _agent_denial_ceiling(self) -> Ruleset:
+        """This agent's effective denials, resolved per tool.
+
+        Copying the agent's literal ``deny`` rules does not work: every
+        restrictive agent here is written as ``deny *`` followed by an
+        allow-list, so the copy keeps the ``deny *`` and drops everything that
+        re-opens it — handing a child a ceiling that forbids all tools. Asking
+        for the agent's *verdict* on each known tool preserves the allow-list,
+        because the verdict already accounts for it.
+        """
+        return Ruleset(
+            rules=[
+                PermissionRule(action="deny", permission=tool.id)
+                for tool in self.tool_registry.all_tools()
+                if agent_verdict(tool.id, "*", self.agent.permissions) == "deny"
+            ]
+        )
+
     def _build_system_prompt_parts(self) -> SystemPromptParts:
         """Resolve every impure input and call :func:`assemble_system_prompt`.
 
@@ -1006,7 +1082,16 @@ def _collapsed_row_stats(rows: list[Message]) -> tuple[int, int, int, int]:
                 tool_results += 1
                 state = pdata.get("state", {}) or {}
                 tokens += estimate_tokens(str(state.get("input", "")))
-                tokens += estimate_tokens(str(state.get("output", "")))
+                # A part compaction already pruned costs the prompt the
+                # "[truncated]" placeholder, not its stored output — the row
+                # keeps the original text so the user can still read it. Count
+                # what the model sees, or this number (which is shown to the
+                # user in the collapse boundary) claims a saving that is not
+                # there.
+                if state.get("time_compacted"):
+                    tokens += estimate_tokens("[truncated]")
+                else:
+                    tokens += estimate_tokens(str(state.get("output", "")))
     return tokens, users, assistants, tool_results
 
 

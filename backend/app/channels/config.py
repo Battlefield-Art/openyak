@@ -13,6 +13,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+
 logger = logging.getLogger(__name__)
 
 # Default path for channels configuration
@@ -47,12 +48,3 @@ def load_channels_config(config_path: Path | None = None) -> ChannelsConfig:
         return ChannelsConfig()
 
 
-def save_channels_config(config: ChannelsConfig, config_path: Path | None = None) -> None:
-    """Save channels configuration to JSON file."""
-    path = config_path or _DEFAULT_CONFIG_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(config.model_dump(), indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    logger.info("Saved channels config to %s", path)

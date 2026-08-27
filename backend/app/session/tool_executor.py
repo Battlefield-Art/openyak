@@ -1,13 +1,21 @@
-"""Streaming tool executor — inspired by Claude Code's StreamingToolExecutor.
+"""Streaming tool executor — overlaps tool I/O with LLM streaming.
 
-Key behavior:
-  - Tools can be submitted during LLM streaming (before streaming completes)
-  - Concurrent-safe tools start executing immediately in background tasks
-  - Exclusive tools are queued and run sequentially after concurrent ones
-  - Results are collected in submission order after streaming completes
+Tools are submitted as their call chunks arrive, so a read can start before the
+model has finished writing the next call. That overlap is the point of this
+class; the ordering rules below are what keep it safe.
 
-This overlaps LLM network latency with tool I/O — the core performance
-insight from Claude Code's architecture.
+**Execution follows model order.** An exclusive tool is a barrier: everything
+the model asked for before it finishes first, and nothing after it starts until
+it is done. Running every concurrent tool first and the exclusive ones
+afterwards would be faster and wrong — the model that emits
+``[write(f), read(f)]`` means "write, then read what I wrote", and reordering
+silently answers from the pre-write file. Results are reported in model order
+either way, so a reordering bug is invisible in the transcript.
+
+**Concurrency is bounded.** A run of consecutive concurrency-safe calls executes
+in parallel up to ``max_parallel_tool_calls``. Unbounded fan-out puts one
+model turn's worth of ``web_fetch`` calls on the network at once, from the
+user's own machine and against their own rate limits.
 """
 
 from __future__ import annotations
@@ -23,10 +31,15 @@ from app.tool.context import ToolContext
 logger = logging.getLogger(__name__)
 
 
-# Bash errors cancel sibling concurrent tools (inspired by Claude Code).
-# Bash commands often form implicit dependency chains — if one fails,
-# continuing siblings is pointless and can cause confusing cascading errors.
-SIBLING_ABORT_TOOLS = frozenset({"bash"})
+# There is deliberately no failure cascade here. A `SIBLING_ABORT_TOOLS` set
+# existed for bash on the theory that shell commands form dependency chains, but
+# it was unreachable — bash is exclusive, and the cascade lived on a
+# concurrent-only path — so it had never run. Making it run showed why it should
+# not: `BashTool` reports any non-zero exit as `ToolResult.error`, and a non-zero
+# exit is how `grep`, `test` and `diff` answer "no". Every such answer would have
+# cancelled the rest of the turn. The barrier already gives the model ordering it
+# can rely on; deciding that one tool's result invalidates the next is the
+# model's judgement to make, not the scheduler's.
 
 
 @dataclass
@@ -53,7 +66,6 @@ class ToolExecutionResult:
     result: ToolResult | None = None
     error: Exception | None = None
     timed_out: bool = False
-    aborted_by_sibling: bool = False
 
 
 async def _execute_single(info: ToolCallInfo) -> ToolExecutionResult:
@@ -101,136 +113,231 @@ class StreamingToolExecutor:
         results = await executor.collect()
     """
 
-    def __init__(self, abort_event: asyncio.Event) -> None:
+    def __init__(
+        self, abort_event: asyncio.Event, *, max_parallel: int | None = None
+    ) -> None:
         self._abort = abort_event
-        self._concurrent_tasks: list[tuple[ToolCallInfo, asyncio.Task]] = []
-        self._exclusive_queue: list[ToolCallInfo] = []
+        self._calls: list[ToolCallInfo] = []
+        self._started: dict[int, asyncio.Task] = {}
         self._results: dict[int, ToolExecutionResult] = {}
-        self._submission_order: list[int] = []
-        # Sibling abort: set when a bash tool errors, cancels other concurrent tasks
-        self._sibling_errored = False
-        self._sibling_error_desc = ""
+        self._barrier_pending = False
+        # Indices this executor cancelled itself. `Task.cancelled()` cannot tell
+        # those apart from a tool cancelled as a side effect of the *caller*
+        # being cancelled: a task suspended at `await task` has that task as its
+        # `_fut_waiter`, so cancelling the caller cancels the tool too, and
+        # asyncio never re-delivers the caller's cancellation once it is caught.
+        self._self_cancelled: set[int] = set()
+        if max_parallel is None:
+            from app.config import get_settings
+
+            max_parallel = get_settings().max_parallel_tool_calls
+        self._slots = asyncio.Semaphore(max(1, max_parallel))
 
     def submit(self, info: ToolCallInfo) -> None:
-        """Submit a tool for execution.
+        """Record a tool call in model order, starting it early when that is safe.
 
-        Concurrent-safe tools start immediately as background tasks.
-        Exclusive tools are queued for sequential execution after streaming.
+        A concurrency-safe call may start during streaming only while no
+        exclusive call is still outstanding ahead of it. Once one is queued it
+        becomes a barrier, and everything after waits for :meth:`collect` to
+        reach it in order.
         """
-        self._submission_order.append(info.index)
+        self._calls.append(info)
 
-        if info.tool.is_concurrency_safe:
-            task = asyncio.create_task(
-                _execute_single(info),
-                name=f"tool-{info.tool_name}-{info.call_id[:8]}",
-            )
-            self._concurrent_tasks.append((info, task))
-            logger.info(
-                "Started concurrent tool %s (call_id=%s) during streaming",
-                info.tool_name, info.call_id[:8],
-            )
-        else:
-            self._exclusive_queue.append(info)
+        if not info.tool.is_concurrency_safe:
+            self._barrier_pending = True
             logger.debug(
-                "Queued exclusive tool %s (call_id=%s) for post-stream execution",
+                "Queued exclusive tool %s (call_id=%s); it is a barrier for later calls",
                 info.tool_name, info.call_id[:8],
             )
+            return
+
+        if self._barrier_pending:
+            logger.debug(
+                "Deferred %s (call_id=%s) behind an earlier exclusive tool",
+                info.tool_name, info.call_id[:8],
+            )
+            return
+
+        self._started[info.index] = asyncio.create_task(
+            self._run(info), name=f"tool-{info.tool_name}-{info.call_id[:8]}"
+        )
+        logger.info(
+            "Started concurrent tool %s (call_id=%s) during streaming",
+            info.tool_name, info.call_id[:8],
+        )
+
+    async def _run(self, info: ToolCallInfo) -> ToolExecutionResult:
+        """Execute one call, holding a concurrency slot for its duration."""
+        async with self._slots:
+            return await _execute_single(info)
 
     async def collect(self) -> list[ToolExecutionResult]:
-        """Wait for all submitted tools to complete and return results in order.
-
-        1. Await all concurrent background tasks (with sibling abort)
-        2. Execute exclusive tools sequentially
-        3. Return results sorted by submission order
-        """
-        # 1. Collect concurrent results
-        for info, task in self._concurrent_tasks:
-            try:
-                result = await task
-                self._results[result.index] = result
-
-                # Sibling abort: if a bash tool errored, cancel remaining
-                # concurrent tasks. Bash commands often have implicit dependency
-                # chains — if one fails, continuing siblings is pointless.
-                if (
-                    result.error is not None
-                    and result.tool_name in SIBLING_ABORT_TOOLS
-                    and not self._sibling_errored
+        """Run everything still outstanding in model order and return all results."""
+        position = 0
+        while position < len(self._calls):
+            if self._calls[position].tool.is_concurrency_safe:
+                group: list[ToolCallInfo] = []
+                while (
+                    position < len(self._calls)
+                    and self._calls[position].tool.is_concurrency_safe
                 ):
-                    self._sibling_errored = True
-                    _input_summary = str(info.tool_args.get("command", ""))[:40]
-                    self._sibling_error_desc = (
-                        f"{info.tool_name}({_input_summary})"
-                        if _input_summary else info.tool_name
-                    )
-                    logger.info(
-                        "Bash tool %s errored — cancelling sibling concurrent tasks",
-                        info.call_id[:8],
-                    )
-                    self._cancel_remaining_concurrent(info.index)
+                    group.append(self._calls[position])
+                    position += 1
+                await self._run_group(group)
+            else:
+                await self._run_exclusive(self._calls[position])
+                position += 1
 
-            except asyncio.CancelledError:
-                # Task was cancelled by sibling abort or external abort
-                msg = (
-                    f"Cancelled: parallel tool call {self._sibling_error_desc} errored"
-                    if self._sibling_errored
-                    else "Cancelled"
-                )
-                self._results[info.index] = ToolExecutionResult(
-                    index=info.index, tool_name=info.tool_name,
-                    call_id=info.call_id, tool_args=info.tool_args,
-                    error=asyncio.CancelledError(msg),
-                    aborted_by_sibling=self._sibling_errored,
-                )
-            except Exception as e:
-                self._results[info.index] = ToolExecutionResult(
-                    index=info.index, tool_name=info.tool_name,
-                    call_id=info.call_id, tool_args=info.tool_args,
-                    error=e,
-                )
-
-        # 2. Execute exclusive tools sequentially
-        for info in self._exclusive_queue:
-            if self._abort.is_set() or self._sibling_errored:
-                msg = (
-                    f"Cancelled: parallel tool call {self._sibling_error_desc} errored"
-                    if self._sibling_errored
-                    else "Aborted"
-                )
-                self._results[info.index] = ToolExecutionResult(
-                    index=info.index, tool_name=info.tool_name,
-                    call_id=info.call_id, tool_args=info.tool_args,
-                    error=asyncio.CancelledError(msg),
-                    aborted_by_sibling=self._sibling_errored,
-                )
-                continue
-
-            result = await _execute_single(info)
-            self._results[result.index] = result
-
-        # 3. Return in submission order
         return [
-            self._results[idx]
-            for idx in self._submission_order
-            if idx in self._results
+            self._results[info.index]
+            for info in self._calls
+            if info.index in self._results
         ]
 
-    def _cancel_remaining_concurrent(self, errored_index: int) -> None:
-        """Cancel all concurrent tasks that haven't completed yet."""
-        for info, task in self._concurrent_tasks:
-            if info.index != errored_index and not task.done():
-                task.cancel()
-                logger.debug(
-                    "Cancelled sibling tool %s (call_id=%s)",
-                    info.tool_name, info.call_id[:8],
+    async def _run_group(self, group: list[ToolCallInfo]) -> None:
+        """Run a run of adjacent concurrency-safe calls together."""
+        if self._stopped:
+            # Calls already started keep running inside ``await tool(...)`` —
+            # the abort check in _execute_single only guards the moment before
+            # dispatch. Cancel and reap them rather than reporting "Aborted"
+            # while they carry on writing files in the background.
+            #
+            # Cancel every one first, then reap: a cancellation landing on us
+            # mid-reap would otherwise leave the untouched remainder running.
+            # Recording the outcomes goes in a `finally` for the same reason.
+            # Anything that already finished keeps its real result; only work
+            # still in flight is cancelled.
+            self.harvest_finished()
+            live = []
+            for info in group:
+                task = self._started.get(info.index)
+                if task is not None and not task.done():
+                    live.append(task)
+                    self._self_cancelled.add(info.index)
+                    task.cancel()
+            try:
+                if live:
+                    await asyncio.gather(*live, return_exceptions=True)
+            finally:
+                self.harvest_finished()
+                for info in group:
+                    self._record_cancelled(info)
+            return
+
+        tasks: dict[int, asyncio.Task] = {}
+        for info in group:
+            task = self._started.get(info.index)
+            if task is None:
+                task = asyncio.create_task(
+                    self._run(info), name=f"tool-{info.tool_name}-{info.call_id[:8]}"
                 )
+                # Register it: ``_started`` is the one place that knows which
+                # calls have a live task, and cancel_all/harvest_finished both
+                # read it. A task created only here would be invisible to both,
+                # so aborting a turn could not stop anything queued behind a
+                # barrier.
+                self._started[info.index] = task
+            tasks[info.index] = task
+
+        try:
+            for info in group:
+                await self._settle(info, tasks[info.index])
+        finally:
+            # Whatever ended this group — an abort mid-way, or the caller being
+            # cancelled — no task in it may outlive it unobserved.
+            pending = [t for t in tasks.values() if not t.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _run_exclusive(self, info: ToolCallInfo) -> None:
+        """Run one barrier call; everything before it has already settled."""
+        if self._stopped:
+            self._record_cancelled(info)
+            return
+
+        result = await _execute_single(info)
+        self._results[info.index] = result
+
+    async def _settle(self, info: ToolCallInfo, task: asyncio.Task) -> None:
+        """Await one started call and record whatever it produced."""
+        if self._stopped and not task.done():
+            self._self_cancelled.add(info.index)
+            task.cancel()
+        try:
+            result = await task
+        except asyncio.CancelledError:
+            self._record_cancelled(info)
+            # Distinguish "this tool was cancelled" from "the caller awaiting us
+            # was cancelled". Swallowing the latter makes collect() return
+            # normally, and asyncio never re-delivers it — so the processor's
+            # cancellation cleanup (persist partial output, terminate running
+            # ToolParts) is skipped and the turn looks like it finished.
+            #
+            # Only a cancellation this executor issued is ours to absorb.
+            # `task.cancelled()` is true either way — cancelling the caller
+            # cancels the tool it is suspended on — and `Task.cancelling()` is a
+            # monotone counter that nothing here uncancels while the processor's
+            # shield loops bump it. Neither can discriminate; the record can.
+            if info.index not in self._self_cancelled:
+                raise
+            return
+        except Exception as exc:  # a crash inside the wrapper, not the tool
+            self._results[info.index] = ToolExecutionResult(
+                index=info.index, tool_name=info.tool_name,
+                call_id=info.call_id, tool_args=info.tool_args,
+                error=exc,
+            )
+            return
+
+        self._results[info.index] = result
+
+    @property
+    def _stopped(self) -> bool:
+        return self._abort.is_set()
+
+    def _record_cancelled(self, info: ToolCallInfo) -> None:
+        """Record a call that never produced a result, without losing one that did."""
+        if info.index in self._results:
+            return  # it finished before the abort landed; keep the real outcome
+        self._results[info.index] = ToolExecutionResult(
+            index=info.index, tool_name=info.tool_name,
+            call_id=info.call_id, tool_args=info.tool_args,
+            error=asyncio.CancelledError("Aborted"),
+        )
+
+    def harvest_finished(self) -> list[ToolExecutionResult]:
+        """Results from calls that already ran, without starting any more.
+
+        For teardown: a turn abandoned mid-stream still has tools that
+        completed during it. Recording those as "cancelled" tells the user an
+        email was not sent when it was. Nothing not already running is started.
+        """
+        harvested: list[ToolExecutionResult] = []
+        for info in self._calls:
+            existing = self._results.get(info.index)
+            if existing is not None:
+                harvested.append(existing)
+                continue
+            task = self._started.get(info.index)
+            if task is None or not task.done() or task.cancelled():
+                continue
+            if task.exception() is not None:
+                continue
+            result = task.result()
+            self._results[info.index] = result
+            harvested.append(result)
+        return harvested
 
     def cancel_all(self) -> None:
-        """Cancel all pending concurrent tasks."""
-        for _, task in self._concurrent_tasks:
+        """Cancel every started call that has not finished."""
+        for index, task in self._started.items():
             if not task.done():
+                self._self_cancelled.add(index)
                 task.cancel()
+                logger.debug("Cancelled in-flight tool at index %d", index)
 
     @property
     def has_submissions(self) -> bool:
-        return bool(self._submission_order)
+        return bool(self._calls)

@@ -19,11 +19,12 @@ from typing import Any
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import selectinload
 
 from app.agent.agent import AgentRegistry
 from app.models.message import Message, Part
 from app.provider.registry import ProviderRegistry
-from app.session.manager import create_message, create_part
+from app.session.manager import create_message, create_part, prompt_visible_messages
 from app.streaming.events import (
     COMPACTED,
     COMPACTION_ERROR,
@@ -46,6 +47,55 @@ PROTECTED_TOKEN_BUDGET = 40_000  # Protect this many tokens of tool output
 SKIP_RECENT_TURNS = 2  # Don't compact the last N assistant messages
 PROTECTED_TOOLS = frozenset({"skill"})  # Never prune these tool outputs
 AUTO_COMPACT_CONTEXT_RATIO = 0.85  # Proactively compact before the hard context edge
+SUMMARY_MAX_TOKENS = 4096  # Output cap for the summary
+SUMMARY_RETRY_MAX_TOKENS = 12_288
+"""Second-attempt cap when the first summary is cut off at the limit.
+
+Discarding a truncated checkpoint is right — it would replace everything it was
+meant to summarise with a sentence that stops mid-thought — but discarding it
+three times in a row trips the caller's circuit breaker and dead-ends a session
+that used to survive. A long history, or a reasoning model spending the budget
+before it writes any summary, needs more room, not fewer attempts.
+"""
+
+
+def _wrap_summary(summary: str, *, visible: bool) -> str:
+    """The exact text a summary is persisted as.
+
+    One definition, so the shrink guard measures what the next request will
+    actually carry rather than the bare summary.
+    """
+    if visible:
+        return f"[Context Summary]\n\n{summary}"
+    return f"[Context Summary]\n\n{summary}\n\nContinue if you have next steps."
+
+
+def _estimate_message_tokens(messages: list[dict[str, Any]]) -> int:
+    """Approximate the context cost of an LLM message list.
+
+    Counts every field that reaches the request body. ``reasoning_content`` is
+    one of them: ``get_message_history_for_llm`` attaches it to assistant turns
+    for DeepSeek-family and custom OpenAI-compatible providers, up to 40k chars
+    per turn. Omitting it under-counts the history so badly that the shrink
+    guard rejects perfectly good summaries on exactly those providers.
+    """
+    total = 0
+    for message in messages:
+        for key in ("content", "reasoning_content"):
+            value = message.get(key)
+            if isinstance(value, str):
+                total += estimate_tokens(value)
+            elif isinstance(value, list):
+                for block in value:
+                    if isinstance(block, dict):
+                        text = block.get("text")
+                        if isinstance(text, str):
+                            total += estimate_tokens(text)
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") if isinstance(call, dict) else None
+            if isinstance(function, dict):
+                total += estimate_tokens(str(function.get("arguments", "")))
+    return total
 
 
 @dataclass
@@ -53,6 +103,14 @@ class CompactionResult:
     pruned_parts: int = 0
     summary: str | None = None
     summary_visible: bool = False
+    tokens_freed: int = 0
+    """Approximate context tokens this run actually reclaimed.
+
+    Callers gate their retry budget on this rather than on the call returning:
+    a run that summarises nothing and prunes nothing still returns normally, and
+    treating that as success lets an unproductive compaction loop reset its own
+    circuit breaker forever.
+    """
 
 
 async def run_compaction(
@@ -83,7 +141,10 @@ async def run_compaction(
     job.publish(SSEEvent(COMPACTION_PHASE, {
         "session_id": session_id, "phase": "prune", "status": "started",
     }))
-    result.pruned_parts = await _phase1_prune(session_id, session_factory=session_factory)
+    result.pruned_parts, pruned_tokens = await _phase1_prune(
+        session_id, session_factory=session_factory
+    )
+    result.tokens_freed += pruned_tokens
     job.publish(SSEEvent(COMPACTION_PHASE, {
         "session_id": session_id, "phase": "prune", "status": "completed",
     }))
@@ -96,7 +157,7 @@ async def run_compaction(
     job.publish(SSEEvent(COMPACTION_PHASE, {
         "session_id": session_id, "phase": "summarize", "status": "started",
     }))
-    result.summary = await _phase2_summarize(
+    result.summary, summary_tokens_freed = await _phase2_summarize(
         session_id,
         job=job,
         session_factory=session_factory,
@@ -104,6 +165,7 @@ async def run_compaction(
         agent_registry=agent_registry,
         model_id=model_id,
     )
+    result.tokens_freed += summary_tokens_freed
     job.publish(SSEEvent(COMPACTION_PHASE, {
         "session_id": session_id, "phase": "summarize", "status": "completed",
     }))
@@ -134,11 +196,7 @@ async def run_compaction(
                     session_id=session_id,
                     data={
                         "type": "text",
-                        "text": (
-                            f"[Context Summary]\n\n{result.summary}"
-                            if visible_summary
-                            else f"[Context Summary]\n\n{result.summary}\n\nContinue if you have next steps."
-                        ),
+                        "text": _wrap_summary(result.summary, visible=visible_summary),
                         "synthetic": True,
                     },
                 )
@@ -163,22 +221,29 @@ async def _phase1_prune(
     session_id: str,
     *,
     session_factory: async_sessionmaker[AsyncSession],
-) -> int:
-    """Mark old tool outputs as truncated to reduce context size."""
+) -> tuple[int, int]:
+    """Flag old tool outputs as compacted. Returns (parts flagged, tokens freed)."""
     pruned_parts = 0
+    tokens_freed = 0
     async with session_factory() as db:
         async with db.begin():
             # Get all messages ordered by time
             stmt = (
                 select(Message)
                 .where(Message.session_id == session_id)
+                .options(selectinload(Message.parts))
                 .order_by(Message.time_created.asc())
             )
             result = await db.execute(stmt)
-            messages = list(result.scalars().all())
+            # Only rows the model still sees can free context. A row already
+            # collapsed, or sitting before the newest compaction anchor, is out
+            # of the prompt either way — flagging its tool parts changes nothing
+            # and would credit `tokens_freed` for a saving that does not exist,
+            # which is now what resets the compaction circuit breaker.
+            messages = prompt_visible_messages(list(result.scalars().all()))
 
             if len(messages) <= SKIP_RECENT_TURNS * 2:
-                return 0  # Not enough history to prune
+                return 0, 0  # Not enough history to prune
 
             # Skip the last N turns (each turn = user + assistant)
             cutoff = len(messages) - (SKIP_RECENT_TURNS * 2)
@@ -216,20 +281,25 @@ async def _phase1_prune(
                         token_budget -= output_tokens
                         continue  # Protected
 
-                    # Mark as compacted
+                    # Flag the part as compacted, but keep the stored output.
+                    # ``get_message_history_for_llm`` substitutes "[truncated]"
+                    # from this flag alone, so the prompt is byte-identical
+                    # either way — overwriting would only destroy the user's
+                    # own copy of a tool result they may still need, and would
+                    # break the ADR-0005 promise that pruned history stays
+                    # recoverable.
                     updated_data = dict(part.data)
                     updated_state = dict(state)
-                    updated_state["output"] = "[truncated]"
                     updated_state["time_compacted"] = "auto"
                     updated_data["state"] = updated_state
                     part.data = updated_data
                     pruned_parts += 1
+                    tokens_freed += output_tokens
 
             await db.flush()
-    return pruned_parts
+    return pruned_parts, tokens_freed
 
-
-async def _phase2_summarize(
+async def _summarize_once(
     session_id: str,
     *,
     job: GenerationJob,
@@ -237,22 +307,27 @@ async def _phase2_summarize(
     provider_registry: ProviderRegistry,
     agent_registry: AgentRegistry,
     model_id: str | None = None,
-) -> str | None:
-    """Generate a structured summary of the conversation."""
+    max_tokens: int,
+) -> tuple[str | None, int, bool]:
+    """One summarisation attempt.
+
+    Returns ``(summary, tokens freed, hit the output cap)``. The third value
+    lets the caller decide whether a larger budget is worth one more request.
+    """
     compaction_agent = agent_registry.get("compaction")
     if not compaction_agent or not compaction_agent.system_prompt:
-        return None
+        return None, 0, False
 
     # Find a model
     if not model_id:
         models = provider_registry.all_models()
         if not models:
-            return None
+            return None, 0, False
         model_id = models[0].id
 
     resolved = provider_registry.resolve_model(model_id)
     if not resolved:
-        return None
+        return None, 0, False
 
     provider, model_info = resolved
 
@@ -269,7 +344,7 @@ async def _phase2_summarize(
             )
 
     if not llm_messages:
-        return None
+        return None, 0, False
 
     # Ask compaction agent to summarize
     try:
@@ -281,15 +356,18 @@ async def _phase2_summarize(
         summary = ""
         usage_data: dict[str, Any] = {}
         last_reported = 0
+        finish_reason: str | None = None
         async for chunk in provider.stream_chat(
             model_id,
             messages,
             system=compaction_agent.system_prompt,
-            max_tokens=4096,
+            max_tokens=max_tokens,
         ):
             if job.abort_event.is_set():
                 logger.info("Compaction summarize stream aborted for session %s", session_id)
-                return None
+                return None, 0, False
+            if chunk.type == "finish":
+                finish_reason = chunk.data.get("reason")
             if chunk.type == "text-delta":
                 summary += chunk.data.get("text", "")
                 # Emit progress every ~200 chars to avoid flooding
@@ -326,7 +404,44 @@ async def _phase2_summarize(
                 usage_data.get("total", 0), cost, session_id,
             )
 
-        return summary.strip() if summary.strip() else None
+        summary = summary.strip()
+        if not summary:
+            return None, 0, False
+
+        # A summary that hit the output cap is a half-written checkpoint. It
+        # would still be non-empty, still get persisted, and — because the
+        # newest summary becomes the permanent history anchor — would replace
+        # everything it was meant to summarise with a sentence that stops
+        # mid-thought. Refuse it and let the caller's retry budget decide.
+        if finish_reason == "length":
+            logger.warning(
+                "Compaction summary for session %s hit the %d-token cap",
+                session_id,
+                max_tokens,
+            )
+            return None, 0, True
+
+        # Compaction must shrink the context it anchors past. On a short or
+        # tool-light history the summary can be larger than the turns it
+        # replaces, which makes the next request worse, not better.
+        #
+        # Both sides are measured as they will exist in the next request: the
+        # summary is persisted inside a fixed wrapper, and counting the bare
+        # text instead leaves a permanent positive margin that reads as progress
+        # on a session where compaction is achieving nothing.
+        summary_tokens = estimate_tokens(_wrap_summary(summary, visible=False))
+        replaced_tokens = _estimate_message_tokens(llm_messages)
+        if summary_tokens >= replaced_tokens:
+            logger.warning(
+                "Compaction summary for session %s (~%d tokens) does not shrink the "
+                "~%d tokens it would anchor past; discarding",
+                session_id,
+                summary_tokens,
+                replaced_tokens,
+            )
+            return None, 0, False
+
+        return summary, replaced_tokens - summary_tokens, False
 
     except Exception as e:
         logger.warning("Failed to generate compaction summary: %s", e)
@@ -334,7 +449,33 @@ async def _phase2_summarize(
             "session_id": session_id,
             "message": "Context compression failed. Consider starting a new chat.",
         }))
-        return None
+        return None, 0, False
+
+
+
+async def _phase2_summarize(
+    session_id: str,
+    *,
+    job: GenerationJob,
+    session_factory: async_sessionmaker[AsyncSession],
+    provider_registry: ProviderRegistry,
+    agent_registry: AgentRegistry,
+    model_id: str | None = None,
+) -> tuple[str | None, int]:
+    """Summarise the conversation. Returns (summary, approximate tokens freed)."""
+    for max_tokens in (SUMMARY_MAX_TOKENS, SUMMARY_RETRY_MAX_TOKENS):
+        summary, freed, hit_cap = await _summarize_once(
+            session_id,
+            job=job,
+            session_factory=session_factory,
+            provider_registry=provider_registry,
+            agent_registry=agent_registry,
+            model_id=model_id,
+            max_tokens=max_tokens,
+        )
+        if not hit_cap:
+            return summary, freed
+    return None, 0
 
 
 def should_compact(

@@ -10,7 +10,7 @@ import asyncio
 import os
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from app.tool.base import ToolDefinition, ToolResult
 from app.tool.context import ToolContext
@@ -32,6 +32,11 @@ class BashTool(ToolDefinition):
     @property
     def id(self) -> str:
         return "bash"
+
+    @property
+    def truncation_direction(self) -> Literal["head", "tail"]:
+        """Keep the end: a failed run reports why on its last lines."""
+        return "tail"
 
     @property
     def description(self) -> str:
@@ -132,7 +137,11 @@ class BashTool(ToolDefinition):
         exit_code = result.returncode
 
         if exit_code != 0:
-            output = f"Exit code: {exit_code}\n{output}"
+            # Trailing, not leading: this tool truncates from the head
+            # (see truncation_direction), so a header on a long failing
+            # run is the first thing dropped — and it is the only signal
+            # the model gets that the command failed at all.
+            output = f"{output}\n\nExit code: {exit_code}"
 
         return ToolResult(
             output=output,
